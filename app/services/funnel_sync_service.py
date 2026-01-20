@@ -220,7 +220,6 @@ class FunnelSyncService:
                     LEFT JOIN {table_prefix}services s ON a.id_services = s.id
                     WHERE a.book_datetime >= %s
                         AND u.id_roles = 4
-                        AND (a.is_unavailable = 0 OR a.is_unavailable IS NULL)
                     ORDER BY a.book_datetime ASC
                 """
 
