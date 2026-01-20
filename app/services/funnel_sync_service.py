@@ -164,14 +164,77 @@ class FunnelSyncService:
 
     async def _fetch_easyappointments(self, config: Dict, sync_from: datetime) -> List[Dict]:
         """
-        Fetch appointments from EasyAppointments API.
-
-        This is a placeholder - implement actual API integration.
+        Fetch appointments from EasyAppointments MySQL database.
         """
-        # TODO: Implement actual EasyAppointments API call
-        # For now, return empty list
-        logger.info(f"Fetching appointments from {sync_from}")
-        return []
+        import os
+        import pymysql
+
+        # Get MySQL credentials from environment
+        mysql_host = os.getenv("EASYAPPOINTMENTS_MYSQL_HOST", "mysql.railway.internal")
+        mysql_port = int(os.getenv("EASYAPPOINTMENTS_MYSQL_PORT", "3306"))
+        mysql_user = os.getenv("EASYAPPOINTMENTS_MYSQL_USER", "root")
+        mysql_password = os.getenv("EASYAPPOINTMENTS_MYSQL_PASSWORD")
+        mysql_database = os.getenv("EASYAPPOINTMENTS_MYSQL_DATABASE", "railway")
+        table_prefix = os.getenv("EASYAPPOINTMENTS_TABLE_PREFIX", "ea_")
+
+        logger.info(f"Fetching appointments from {sync_from} (host: {mysql_host})")
+
+        try:
+            # Connect to EasyAppointments MySQL database
+            connection = pymysql.connect(
+                host=mysql_host,
+                port=mysql_port,
+                user=mysql_user,
+                password=mysql_password,
+                database=mysql_database,
+                cursorclass=pymysql.cursors.DictCursor
+            )
+
+            with connection.cursor() as cursor:
+                # Query appointments with customer and service details
+                sql = f"""
+                    SELECT
+                        a.id as appointment_id,
+                        a.book_datetime,
+                        a.start_datetime,
+                        a.end_datetime,
+                        a.hash,
+                        a.notes,
+                        u.id as customer_id,
+                        u.email,
+                        u.first_name,
+                        u.last_name,
+                        u.mobile_number,
+                        u.phone_number,
+                        u.address,
+                        u.city,
+                        u.state,
+                        u.zip_code,
+                        s.id as service_id,
+                        s.name as service_name,
+                        s.price,
+                        s.duration,
+                        s.currency
+                    FROM {table_prefix}appointments a
+                    JOIN {table_prefix}users u ON a.id_users_customer = u.id
+                    LEFT JOIN {table_prefix}services s ON a.id_services = s.id
+                    WHERE a.book_datetime >= %s
+                        AND u.id_roles = 4
+                        AND (a.is_unavailable = 0 OR a.is_unavailable IS NULL)
+                    ORDER BY a.book_datetime ASC
+                """
+
+                cursor.execute(sql, (sync_from,))
+                appointments = cursor.fetchall()
+
+            connection.close()
+
+            logger.info(f"Fetched {len(appointments)} appointments from EasyAppointments")
+            return appointments
+
+        except Exception as e:
+            logger.error(f"Failed to fetch from EasyAppointments MySQL: {e}", exc_info=True)
+            raise
 
     async def _create_funnel_event_from_appointment(
         self, db, source_id: str, source_type: str, appointment: Dict
@@ -182,8 +245,67 @@ class FunnelSyncService:
         Returns:
             "created", "updated", or "skipped"
         """
-        # TODO: Implement actual event creation logic
-        return "created"
+        from sqlalchemy import text
+        import uuid
+
+        try:
+            email = appointment.get("email")
+            if not email:
+                return "skipped"
+
+            # Check if event already exists for this appointment
+            external_id = f"ea_appointment_{appointment.get('appointment_id')}"
+
+            existing = db.execute(
+                text("SELECT id FROM funnel_events WHERE external_id = :external_id"),
+                {"external_id": external_id}
+            ).fetchone()
+
+            if existing:
+                return "skipped"
+
+            # Create funnel event
+            event_id = str(uuid.uuid4())
+
+            db.execute(
+                text("""
+                    INSERT INTO funnel_events (
+                        id, funnel_source_id, source_type, event_type,
+                        event_timestamp, email, first_name, last_name,
+                        phone, external_id, external_metadata, created_at
+                    ) VALUES (
+                        :id, :source_id, :source_type, 'appointment_booked',
+                        :event_timestamp, :email, :first_name, :last_name,
+                        :phone, :external_id, :metadata, NOW()
+                    )
+                """),
+                {
+                    "id": event_id,
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "event_timestamp": appointment.get("book_datetime"),
+                    "email": email,
+                    "first_name": appointment.get("first_name"),
+                    "last_name": appointment.get("last_name"),
+                    "phone": appointment.get("mobile_number") or appointment.get("phone_number"),
+                    "external_id": external_id,
+                    "metadata": {
+                        "appointment_id": appointment.get("appointment_id"),
+                        "service_name": appointment.get("service_name"),
+                        "service_price": float(appointment.get("price", 0)) if appointment.get("price") else None,
+                        "start_datetime": str(appointment.get("start_datetime")),
+                        "duration": appointment.get("duration"),
+                        "city": appointment.get("city"),
+                        "state": appointment.get("state")
+                    }
+                }
+            )
+
+            return "created"
+
+        except Exception as e:
+            logger.error(f"Failed to create funnel event: {e}", exc_info=True)
+            raise
 
     async def sync_zoom(self, force_sync: bool = False) -> Dict[str, Any]:
         """Sync Zoom webinar/meeting registrants"""
