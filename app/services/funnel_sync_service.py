@@ -71,7 +71,7 @@ class FunnelSyncService:
                 # For now, this is a placeholder
                 appointments = await self._fetch_easyappointments(config, sync_from)
 
-                # Process appointments and create funnel events
+                # Process appointments and add to pending signup queue
                 leads_created = 0
                 leads_updated = 0
                 leads_skipped = 0
@@ -79,17 +79,17 @@ class FunnelSyncService:
 
                 for appointment in appointments:
                     try:
-                        event_result = await self._create_funnel_event_from_appointment(
-                            db, source_id, source_type, appointment
+                        result = await self._add_to_pending_signups(
+                            db, appointment
                         )
-                        if event_result == "created":
+                        if result == "created":
                             leads_created += 1
-                        elif event_result == "updated":
+                        elif result == "updated":
                             leads_updated += 1
                         else:
                             leads_skipped += 1
                     except Exception as e:
-                        logger.error(f"Failed to process appointment {appointment.get('id')}: {e}")
+                        logger.error(f"Failed to process appointment {appointment.get('appointment_id')}: {e}")
                         errors.append(str(e))
 
                 # Update source last_sync_at
@@ -236,75 +236,101 @@ class FunnelSyncService:
             logger.error(f"Failed to fetch from EasyAppointments MySQL: {e}", exc_info=True)
             raise
 
-    async def _create_funnel_event_from_appointment(
-        self, db, source_id: str, source_type: str, appointment: Dict
-    ) -> str:
+    async def _add_to_pending_signups(self, db, appointment: Dict) -> str:
         """
-        Create funnel event from appointment data.
+        Add EasyAppointments contact to pending signup queue for admin approval.
 
         Returns:
             "created", "updated", or "skipped"
         """
         from sqlalchemy import text
         import uuid
+        import json
 
         try:
             email = appointment.get("email")
             if not email:
+                logger.info(f"Skipping appointment {appointment.get('appointment_id')}: no email")
                 return "skipped"
 
-            # Check if event already exists for this appointment
-            external_id = f"ea_appointment_{appointment.get('appointment_id')}"
-
+            # Check if signup already exists
             existing = db.execute(
-                text("SELECT id FROM funnel_events WHERE external_id = :external_id"),
-                {"external_id": external_id}
+                text("SELECT id, status FROM pending_signup_queue WHERE email = :email"),
+                {"email": email.lower()}
             ).fetchone()
 
             if existing:
-                return "skipped"
+                # Skip if already processed (approved or rejected)
+                if existing[1] in ['approved', 'rejected']:
+                    return "skipped"
 
-            # Create funnel event
-            event_id = str(uuid.uuid4())
+                # Update existing pending record with latest info
+                db.execute(
+                    text("""
+                        UPDATE pending_signup_queue
+                        SET first_name = COALESCE(:first_name, first_name),
+                            last_name = COALESCE(:last_name, last_name),
+                            signup_metadata = :metadata,
+                            updated_at = NOW()
+                        WHERE email = :email
+                    """),
+                    {
+                        "email": email.lower(),
+                        "first_name": appointment.get("first_name"),
+                        "last_name": appointment.get("last_name"),
+                        "metadata": json.dumps({
+                            "source": "easyappointments",
+                            "appointment_id": appointment.get("appointment_id"),
+                            "service_name": appointment.get("service_name"),
+                            "service_price": float(appointment.get("price", 0)) if appointment.get("price") else None,
+                            "appointment_datetime": str(appointment.get("start_datetime")),
+                            "phone": appointment.get("mobile_number") or appointment.get("phone_number"),
+                            "city": appointment.get("city"),
+                            "state": appointment.get("state"),
+                            "address": appointment.get("address")
+                        })
+                    }
+                )
+                return "updated"
+
+            # Create new pending signup
+            signup_id = str(uuid.uuid4())
 
             db.execute(
                 text("""
-                    INSERT INTO funnel_events (
-                        id, funnel_source_id, source_type, event_type,
-                        event_timestamp, email, first_name, last_name,
-                        phone, external_id, external_metadata, created_at
+                    INSERT INTO pending_signup_queue (
+                        id, email, first_name, last_name, company,
+                        user_type, status, signup_metadata, created_at, updated_at
                     ) VALUES (
-                        :id, :source_id, :source_type, 'appointment_booked',
-                        :event_timestamp, :email, :first_name, :last_name,
-                        :phone, :external_id, :metadata, NOW()
+                        :id, :email, :first_name, :last_name, :company,
+                        'brand', 'pending', :metadata, NOW(), NOW()
                     )
                 """),
                 {
-                    "id": event_id,
-                    "source_id": source_id,
-                    "source_type": source_type,
-                    "event_timestamp": appointment.get("book_datetime"),
-                    "email": email,
+                    "id": signup_id,
+                    "email": email.lower(),
                     "first_name": appointment.get("first_name"),
                     "last_name": appointment.get("last_name"),
-                    "phone": appointment.get("mobile_number") or appointment.get("phone_number"),
-                    "external_id": external_id,
-                    "metadata": {
+                    "company": appointment.get("company"),
+                    "metadata": json.dumps({
+                        "source": "easyappointments",
                         "appointment_id": appointment.get("appointment_id"),
                         "service_name": appointment.get("service_name"),
                         "service_price": float(appointment.get("price", 0)) if appointment.get("price") else None,
-                        "start_datetime": str(appointment.get("start_datetime")),
-                        "duration": appointment.get("duration"),
+                        "appointment_datetime": str(appointment.get("start_datetime")),
+                        "phone": appointment.get("mobile_number") or appointment.get("phone_number"),
                         "city": appointment.get("city"),
-                        "state": appointment.get("state")
-                    }
+                        "state": appointment.get("state"),
+                        "address": appointment.get("address")
+                    })
                 }
             )
 
+            logger.info(f"Added {email} to pending signup queue from EasyAppointments appointment {appointment.get('appointment_id')}")
             return "created"
 
         except Exception as e:
-            logger.error(f"Failed to create funnel event: {e}", exc_info=True)
+            logger.error(f"Failed to add to pending signups: {e}", exc_info=True)
             raise
 
     async def sync_zoom(self, force_sync: bool = False) -> Dict[str, Any]:
